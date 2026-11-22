@@ -17,6 +17,7 @@ from .classify import (
     vad_mask,
 )
 from .demo import demo_payload
+from .duck import MixInputError, build_preview, load_music, parse_cues, parse_segments
 from .features import FRAME_HOP, SAMPLE_RATE, extract_features
 
 MIN_REFS = 3
@@ -149,6 +150,34 @@ async def analyze(file: UploadFile = File(...), references: str = Form(...)):
         "segments": segments,
         "stats": stats,
     }
+
+
+@app.post("/api/mix")
+async def mix(
+    file: UploadFile = File(...),
+    segments: str = Form(...),
+    cues: str = Form("[]"),
+    music: UploadFile = File(...),
+):
+    """生成配乐试听混音：逐 20 ms 块规划配乐增益，返回曲线与混音 WAV。
+
+    无解时返回 200 + feasible=false + 冲突讲话时段，前端据此回到原声试听。
+    """
+    data = await file.read()
+    try:
+        voice, _sr, _duration = load_wav(data)
+    except AudioError as exc:
+        _err(400, str(exc))
+    music_data = await music.read()
+
+    try:
+        parsed_segments = parse_segments(segments, voice.size / float(SAMPLE_RATE))
+        parsed_cues = parse_cues(cues, voice.size / float(SAMPLE_RATE))
+        music_signal = load_music(music_data, voice.size)
+    except MixInputError as exc:
+        _err(400, str(exc))
+
+    return build_preview(voice, music_signal, parsed_segments, parsed_cues)
 
 
 def _static_dir() -> str:

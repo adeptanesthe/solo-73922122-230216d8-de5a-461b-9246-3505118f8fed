@@ -62,6 +62,41 @@
       <div id="timeline" class="timeline hidden"></div>
       <div id="segTable" class="hidden"></div>
     </section>
+
+    <section class="panel" id="musicPanel">
+      <h2>4. 配乐试听</h2>
+      <p class="hint">
+        上传一条与录音<b>等长</b>的 16 kHz 单声道 WAV 作配乐。与甲、乙或待复核分段重叠的
+        20 ms 块会自动压低配乐（300～3400 Hz 频带内 RMS ≤ 原声的一半）；选中的提示音块
+        不压低。配乐增益 0～1，随时间每块最多降 0.10、升 0.04，并在全轨约束下取最高值。
+      </p>
+      <div class="row">
+        <input type="file" id="musicInput" accept=".wav,audio/wav,audio/x-wav">
+        <span id="musicInfo" class="muted">未载入配乐</span>
+        <button id="cueBtn" type="button" disabled>将当前选区设为提示音</button>
+      </div>
+      <div class="row">
+        <h3 class="inline">提示音（不参与压低）</h3>
+        <ul id="cueList" class="refs cues"></ul>
+      </div>
+      <div class="row">
+        <button id="mixBtn" type="button" class="primary" disabled>生成配乐试听</button>
+        <button id="backOriginalBtn" type="button" class="hidden">回到原声试听</button>
+        <span id="mixStatus" class="muted"></span>
+      </div>
+      <div id="mixResult" class="hidden">
+        <div class="row legend">
+          <span><i class="sw gain"></i>配乐增益（逐块最高可行值）</span>
+          <span><i class="sw limit"></i>该块上限</span>
+          <span><i class="sw speech"></i>讲话块（甲/乙/待复核）</span>
+          <span><i class="sw cue"></i>提示音块</span>
+        </div>
+        <canvas id="gainChart" height="150"></canvas>
+        <div id="mixStats" class="muted"></div>
+        <audio id="mixPlayer" controls preload="auto" class="hidden"></audio>
+        <div id="conflicts" class="hidden"></div>
+      </div>
+    </section>
   </main>
 
   <script src="app.js"></script>

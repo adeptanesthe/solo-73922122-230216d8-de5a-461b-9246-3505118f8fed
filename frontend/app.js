@@ -10,6 +10,13 @@ const state = {
   sel: null,              // 当前选区 {start, end}
   result: null,
   stopAt: null,           // 片段复听的停止点
+  music: null,            // 配乐 {file, duration, buffer}
+  cues: [],               // 提示音区间 {start, end}（不参与压低）
+  mix: null,              // 最近一次配乐试听结果
+  mixSeq: 0,              // 请求序号：迟到的响应一律丢弃
+  analyzeSeq: 0,          // 分析请求序号，同样用于丢弃迟到响应
+  musicSeq: 0,            // 配乐解码序号
+  mixObjectUrl: null,
 };
 
 const LABELS = { A: "甲", B: "乙", review: "待复核", silence: "静音" };
@@ -19,6 +26,8 @@ const els = {};
  "playSelBtn", "clearSelBtn", "addABtn", "addBBtn",
  "countA", "countB", "listA", "listB",
  "analyzeBtn", "status", "legend", "timeline", "segTable",
+ "musicInput", "musicInfo", "cueBtn", "cueList", "mixBtn", "backOriginalBtn",
+ "mixStatus", "mixResult", "gainChart", "mixStats", "mixPlayer", "conflicts",
 ].forEach((id) => { els[id] = document.getElementById(id); });
 
 let audioCtx = null;
@@ -40,6 +49,7 @@ function b64ToBlob(b64, type) {
 
 /* ---------- 载入音频 ---------- */
 async function loadFile(file) {
+  const seq = ++state.analyzeSeq;   // 让在途的分析请求作废
   state.file = file;
   if (state.objectUrl) URL.revokeObjectURL(state.objectUrl);
   state.objectUrl = URL.createObjectURL(file);
@@ -48,17 +58,26 @@ async function loadFile(file) {
   try {
     if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     const buf = await file.arrayBuffer();
-    state.buffer = await audioCtx.decodeAudioData(buf.slice(0));
+    const decoded = await audioCtx.decodeAudioData(buf.slice(0));
+    if (seq !== state.analyzeSeq) return;   // 期间又换了录音
+    state.buffer = decoded;
     state.duration = state.buffer.duration;
     els.fileInfo.textContent =
       `${file.name} · ${fmt(state.duration)} · ${state.buffer.sampleRate} Hz · ${state.buffer.numberOfChannels} 声道`;
   } catch (e) {
+    if (seq !== state.analyzeSeq) return;
     state.buffer = null;
     state.duration = 0;
     els.fileInfo.textContent = file.name + "（浏览器无法解码，仍可尝试上传分析）";
   }
   state.sel = null;
   state.result = null;
+  // 更换录音：旧的配乐 / 提示音 / 混音都不再对应这条时间轴，全部撤下
+  state.music = null;
+  state.musicSeq++;
+  els.musicInput.value = "";
+  state.cues = [];
+  invalidateMix("已更换录音，请重新载入配乐并生成试听");
   renderAll();
 }
 
@@ -89,6 +108,13 @@ function drawWave() {
       const x0 = (r.start / dur) * w, x1 = (r.end / dur) * w;
       ctx.fillRect(x0, 0, x1 - x0, h);
     }
+  }
+
+  // 提示音底色（不参与压低的块）
+  ctx.fillStyle = "rgba(5,150,105,0.22)";
+  for (const cue of state.cues) {
+    const x0 = (cue.start / dur) * w, x1 = (cue.end / dur) * w;
+    ctx.fillRect(x0, 0, x1 - x0, h);
   }
 
   // 波形
@@ -172,6 +198,7 @@ els.wave.addEventListener("pointerup", (e) => {
     state.sel = null;
   } else {
     state.sel = { start: Math.min(dragStart, t), end: Math.max(dragStart, t) };
+    invalidateMix("选区已更改，配乐试听已撤下，请重新生成");
   }
   dragStart = null;
   renderSel();
@@ -188,6 +215,7 @@ function renderSel() {
   els.clearSelBtn.disabled = !has;
   els.addABtn.disabled = !has;
   els.addBBtn.disabled = !has;
+  els.cueBtn.disabled = !has || !state.music;
 }
 
 function overlaps(a, b) { return a.start < b.end - 1e-6 && b.start < a.end - 1e-6; }
@@ -204,11 +232,16 @@ function addRef(who) {
   state.refs[who].sort((x, y) => x.start - y.start);
   state.sel = null;
   setStatus("");
+  // 改参考：旧分析结果已失效，旧的配乐混音随之撤下
+  state.result = null;
+  invalidateMix("已修改参考段，请重新分析并生成配乐试听");
   renderAll();
 }
 
 function delRef(who, i) {
   state.refs[who].splice(i, 1);
+  state.result = null;
+  invalidateMix("已修改参考段，请重新分析并生成配乐试听");
   renderAll();
 }
 
@@ -268,6 +301,10 @@ async function analyze() {
   const err = validateRefs();
   if (err) { setStatus(err, "err"); return; }
 
+  // 重做分段：先撤下旧混音并作废在途请求，迟到的响应也不能恢复旧试听
+  const seq = ++state.analyzeSeq;
+  invalidateMix("正在重新分析，旧配乐试听已撤下");
+
   const fd = new FormData();
   fd.append("file", state.file);
   fd.append("references", JSON.stringify({
@@ -280,6 +317,7 @@ async function analyze() {
   try {
     const resp = await fetch("/api/analyze", { method: "POST", body: fd });
     const body = await resp.json();
+    if (seq !== state.analyzeSeq) return;   // 已被更新一次分析 / 新录音取代
     if (!resp.ok) {
       setStatus("分析被拒绝：" + (body.detail || resp.statusText), "err");
       return;
@@ -289,10 +327,11 @@ async function analyze() {
       `分析完成：甲 ${body.stats.A} 帧 / 乙 ${body.stats.B} 帧 / 待复核 ${body.stats.review} 帧 / 静音 ${body.stats.silence} 帧`,
       "ok");
     renderResult();
+    renderMixControls();
   } catch (e) {
-    setStatus("请求失败：" + e.message, "err");
+    if (seq === state.analyzeSeq) setStatus("请求失败：" + e.message, "err");
   } finally {
-    refreshAnalyzeBtn();
+    if (seq === state.analyzeSeq) refreshAnalyzeBtn();
   }
 }
 
@@ -327,6 +366,29 @@ function renderResult() {
     div.onclick = () => playRange(seg.start, seg.end);
     tl.appendChild(div);
   }
+
+  // 提示音圈选（不参与压低的时段）；与讲话段重叠处即冲突来源
+  for (const cue of state.cues) {
+    const mark = document.createElement("div");
+    mark.className = "cue-mark";
+    mark.style.left = (cue.start / dur) * 100 + "%";
+    mark.style.width = Math.max(((cue.end - cue.start) / dur) * 100, 0.2) + "%";
+    mark.title = `提示音 ${fmt(cue.start)} ~ ${fmt(cue.end)}（不参与压低）`;
+    tl.appendChild(mark);
+  }
+  // 无解时圈出造成冲突的讲话时段
+  if (state.mix && !state.mix.feasible) {
+    for (const c of state.mix.conflicts) {
+      const mark = document.createElement("div");
+      mark.className = "conflict-mark";
+      mark.style.left = (c.start / dur) * 100 + "%";
+      mark.style.width = Math.max(((c.end - c.start) / dur) * 100, 0.2) + "%";
+      mark.title = c.reason || "造成冲突的讲话时段";
+      mark.onclick = () => playRange(c.start, c.end);
+      tl.appendChild(mark);
+    }
+  }
+
   const ph = document.createElement("div");
   ph.className = "playhead";
   ph.id = "tlPlayhead";
@@ -350,6 +412,301 @@ function renderResult() {
       playRange(seg.start, seg.end);
     };
   });
+}
+
+/* ---------- 配乐试听 ---------- */
+
+/**
+ * 撤下当前混音（若正在播放则停止并释放音频），并让所有在途的试听请求作废：
+ * 请求序号一递增，迟到的响应在回调里比对序号后会被直接丢弃。
+ */
+function invalidateMix(msg) {
+  state.mixSeq++;
+  state.mix = null;
+  if (state.mixObjectUrl) {
+    URL.revokeObjectURL(state.mixObjectUrl);
+    state.mixObjectUrl = null;
+  }
+  if (els.mixPlayer) {
+    els.mixPlayer.pause();
+    els.mixPlayer.removeAttribute("src");
+    els.mixPlayer.load();
+  }
+  if (els.mixResult) els.mixResult.classList.add("hidden");
+  if (els.mixStatus) els.mixStatus.textContent = msg || "";
+  renderResult();          // 清除时间轴上的冲突圈选
+  renderMixControls();
+}
+
+function renderMixControls() {
+  if (!els.mixBtn) return;
+  const ready = !!(state.file && state.result && state.music);
+  els.mixBtn.disabled = !ready;
+  els.mixBtn.textContent = state.mix ? "重新生成配乐试听" : "生成配乐试听";
+  els.musicInfo.textContent = state.music
+    ? `${state.music.file.name} · ${fmt(state.music.duration)}`
+    : "未载入配乐";
+  if (!els.mixStatus.textContent) {
+    if (state.music && !state.result) {
+      els.mixStatus.textContent = "请先完成第 3 步分析，再生成配乐试听";
+    } else if (!state.music) {
+      els.mixStatus.textContent = "请先载入与录音等长的配乐 WAV";
+    }
+  }
+}
+
+async function loadMusic(file) {
+  if (!state.file) {
+    setStatus("请先载入录音，再上传等长配乐", "err");
+    return;
+  }
+  const seq = ++state.musicSeq;
+  const expected = state.duration;
+  try {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const buf = await audioCtx.decodeAudioData(await file.arrayBuffer());
+    if (seq !== state.musicSeq) return;   // 期间已换录音 / 已选别的配乐
+    if (Math.abs(buf.duration - expected) > 0.01) {
+      throw new Error(`配乐时长 ${fmt(buf.duration)} 与录音 ${fmt(expected)} 不一致`);
+    }
+    state.music = { file, duration: buf.duration, buffer: buf };
+  } catch (e) {
+    if (seq !== state.musicSeq) return;
+    state.music = null;
+    els.musicInput.value = "";
+    els.mixStatus.textContent = "配乐载入失败：" + e.message;
+    renderMixControls();
+    return;
+  }
+  // 换配乐：旧混音作废
+  invalidateMix("已更换配乐，请重新生成试听");
+  renderMixControls();
+}
+
+function addCue() {
+  if (!state.sel || !state.music) return;
+  const seg = { start: +state.sel.start.toFixed(3), end: +state.sel.end.toFixed(3) };
+  if (state.cues.some((c) => overlaps(c, seg))) {
+    state.mixStatus.textContent = "该选区与已有提示音重叠，请重新选择";
+    return;
+  }
+  // 提示音必须落在配乐能覆盖的块里；提示音增益固定为 1，不参与压低
+  state.cues.push(seg);
+  state.cues.sort((a, b) => a.start - b.start);
+  state.sel = null;
+  // 改选区 / 改提示音：旧混音作废
+  invalidateMix("提示音已更新，请重新生成试听");
+  renderAll();
+}
+
+function delCue(i) {
+  state.cues.splice(i, 1);
+  invalidateMix("提示音已更新，请重新生成试听");
+  renderAll();
+}
+
+function renderCues() {
+  els.cueList.innerHTML = "";
+  if (!state.cues.length) {
+    const li = document.createElement("li");
+    li.className = "muted";
+    li.textContent = "暂无提示音";
+    els.cueList.appendChild(li);
+    return;
+  }
+  state.cues.forEach((c, i) => {
+    const li = document.createElement("li");
+    const txt = document.createElement("span");
+    txt.className = "grow";
+    txt.textContent = `提示音 ${i + 1}：${fmt(c.start)} ~ ${fmt(c.end)}`;
+    const play = document.createElement("button");
+    play.textContent = "试听";
+    play.onclick = () => playRange(c.start, c.end);
+    const del = document.createElement("button");
+    del.textContent = "删除";
+    del.onclick = () => delCue(i);
+    li.append(txt, play, del);
+    els.cueList.appendChild(li);
+  });
+}
+
+async function makeMix() {
+  if (!state.file || !state.result || !state.music) return;
+  const seq = ++state.mixSeq;
+  els.mixBtn.disabled = true;
+  els.mixStatus.textContent = "正在计算配乐增益并混音……";
+  els.mixResult.classList.add("hidden");
+
+  const fd = new FormData();
+  fd.append("file", state.file);
+  fd.append("music", state.music.file);
+  fd.append("segments", JSON.stringify(state.result.segments.map((s) => ({
+    label: s.label, start: s.start, end: s.end,
+  }))));
+  fd.append("cues", JSON.stringify(state.cues.map((c) => [c.start, c.end])));
+
+  try {
+    const resp = await fetch("/api/mix", { method: "POST", body: fd });
+    const body = await resp.json();
+    if (seq !== state.mixSeq) return;   // 迟到的响应：状态已变化，丢弃
+    if (!resp.ok) {
+      els.mixStatus.textContent = "生成失败：" + (body.detail || resp.statusText);
+      return;
+    }
+    state.mix = body;
+    renderMixResult();
+  } catch (e) {
+    if (seq === state.mixSeq) els.mixStatus.textContent = "请求失败：" + e.message;
+  } finally {
+    if (seq === state.mixSeq) renderMixControls();
+  }
+}
+
+function renderMixResult() {
+  const mix = state.mix;
+  if (!mix) return;
+  els.mixResult.classList.remove("hidden");
+  els.conflicts.classList.add("hidden");
+  els.conflicts.innerHTML = "";
+  els.mixPlayer.classList.add("hidden");
+  renderResult();          // 时间轴上同步提示音 / 冲突圈选
+  drawGainChart();
+
+  if (!mix.feasible) {
+    els.mixStatus.textContent = "";
+    els.mixStats.textContent = "";
+    els.conflicts.classList.remove("hidden");
+    const title = document.createElement("div");
+    title.className = "conflict-title";
+    title.textContent = mix.message + " 点击时段可回到原声复听：";
+    els.conflicts.appendChild(title);
+    if (!mix.conflicts.length) {
+      const p = document.createElement("div");
+      p.className = "muted";
+      p.textContent = "冲突来自提示音之间的增益速率限制，未能定位到具体讲话段。";
+      els.conflicts.appendChild(p);
+    }
+    for (const c of mix.conflicts) {
+      const btn = document.createElement("button");
+      btn.textContent = `${LABELS[c.label] || "冲突"} ${fmt(c.start)} ~ ${fmt(c.end)} 原声复听`;
+      btn.title = c.reason || "";
+      btn.onclick = () => {
+        els.mixPlayer.pause();
+        els.mixPlayer.classList.add("hidden");
+        els.backOriginalBtn.classList.add("hidden");
+        playRange(c.start, c.end);
+      };
+      els.conflicts.appendChild(btn);
+    }
+    els.backOriginalBtn.classList.remove("hidden");
+    return;
+  }
+
+  // 有解：画曲线 + 试听混音
+  const st = mix.stats;
+  els.mixStatus.textContent = "配乐试听已生成。";
+  els.mixStats.textContent =
+    `共 ${st.blocks} 块（20 ms）· 讲话块 ${st.speech_blocks} · 提示音块 ${st.cue_blocks} · ` +
+    `压低块 ${st.ducked_blocks} · 增益 ${st.min_gain.toFixed(2)}～${st.max_gain.toFixed(2)}` +
+    (mix.mix_scale < 1
+      ? ` · 混音峰值 ${mix.mix_peak_before_scale.toFixed(2)} 超满幅，两轨等比缩小至 ${(mix.mix_scale * 100).toFixed(0)}%`
+      : "");
+  setMixAudio(mix.mix_base64);
+}
+
+function setMixAudio(b64) {
+  if (state.mixObjectUrl) URL.revokeObjectURL(state.mixObjectUrl);
+  state.mixObjectUrl = URL.createObjectURL(b64ToBlob(b64));
+  els.mixPlayer.src = state.mixObjectUrl;
+  els.mixPlayer.classList.remove("hidden");
+  els.backOriginalBtn.classList.remove("hidden");
+}
+
+function backToOriginal() {
+  els.mixPlayer.pause();
+  els.mixPlayer.classList.add("hidden");
+  els.backOriginalBtn.classList.add("hidden");
+  playRange(0, state.duration);
+}
+
+function drawGainChart() {
+  const mix = state.mix;
+  const c = els.gainChart;
+  const dpr = window.devicePixelRatio || 1;
+  const w = c.clientWidth, h = c.clientHeight || 150;
+  c.width = w * dpr; c.height = h * dpr;
+  const ctx = c.getContext("2d");
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, w, h);
+  if (!mix || !mix.gains) return;
+
+  const padL = 34, padB = 18, padT = 8;
+  const plotW = w - padL - 6, plotH = h - padB - padT;
+  const n = mix.gains.length;
+  const xOf = (i) => padL + (n <= 1 ? 0 : (i / (n - 1)) * plotW);
+  const yOf = (g) => padT + (1 - g) * plotH;
+
+  // 讲话块 / 提示音块底色
+  for (let i = 0; i < n; i++) {
+    const x0 = padL + (i / n) * plotW;
+    const bw = Math.max(plotW / n, 0.5);
+    if (mix.speech[i]) {
+      ctx.fillStyle = "rgba(59,130,246,0.16)";
+      ctx.fillRect(x0, padT, bw, plotH);
+    }
+    if (mix.cue[i]) {
+      ctx.fillStyle = "rgba(5,150,105,0.22)";
+      ctx.fillRect(x0, padT, bw, plotH);
+    }
+  }
+
+  // 网格与刻度
+  ctx.strokeStyle = "#e5e7eb";
+  ctx.lineWidth = 1;
+  ctx.fillStyle = "#6b7280";
+  ctx.font = "10px sans-serif";
+  ctx.textAlign = "right";
+  for (const g of [0, 0.5, 1]) {
+    const y = yOf(g);
+    ctx.beginPath();
+    ctx.moveTo(padL, y); ctx.lineTo(w - 6, y);
+    ctx.stroke();
+    ctx.fillText(g.toFixed(1), padL - 4, y + 3);
+  }
+  ctx.textAlign = "center";
+  const dur = mix.duration;
+  for (let s = 0; s <= Math.floor(dur); s++) {
+    const x = padL + (s / dur) * plotW;
+    ctx.fillRect(x, padT + plotH, 1, 4);
+    ctx.fillText(s + "s", x, h - 4);
+  }
+
+  // 该块上限（浅色阶梯）
+  if (mix.limits) {
+    ctx.strokeStyle = "#c4b5fd";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    for (let i = 0; i < n; i++) {
+      const y = yOf(mix.limits[i]);
+      if (i === 0) ctx.moveTo(xOf(i), y);
+      else { ctx.lineTo(xOf(i - 1), y); ctx.lineTo(xOf(i), y); }
+    }
+    ctx.stroke();
+  }
+
+  // 增益曲线
+  ctx.strokeStyle = "#7c3aed";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const x = xOf(i), y = yOf(mix.gains[i]);
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+}
+
+function renderMixPanelState() {
+  renderMixControls();
 }
 
 /* ---------- 播放控制 ---------- */
@@ -386,9 +743,12 @@ async function loadDemo() {
 function renderAll() {
   renderSel();
   renderRefs();
+  renderCues();
   refreshAnalyzeBtn();
   renderResult();
+  renderMixPanelState();
   drawWave();
+  if (state.mix && state.mix.feasible) drawGainChart();
 }
 
 /* ---------- 事件绑定 ---------- */
@@ -397,10 +757,23 @@ els.fileInput.addEventListener("change", (e) => {
 });
 els.demoBtn.addEventListener("click", loadDemo);
 els.playSelBtn.addEventListener("click", () => state.sel && playRange(state.sel.start, state.sel.end));
-els.clearSelBtn.addEventListener("click", () => { state.sel = null; renderAll(); });
+els.clearSelBtn.addEventListener("click", () => {
+  if (!state.sel) return;
+  state.sel = null;
+  invalidateMix("选区已清除，配乐试听已撤下，请重新生成");
+  renderAll();
+});
 els.addABtn.addEventListener("click", () => addRef("A"));
 els.addBBtn.addEventListener("click", () => addRef("B"));
 els.analyzeBtn.addEventListener("click", analyze);
-window.addEventListener("resize", drawWave);
+els.musicInput.addEventListener("change", (e) => {
+  if (e.target.files.length) loadMusic(e.target.files[0]);
+});
+els.cueBtn.addEventListener("click", addCue);
+els.mixBtn.addEventListener("click", makeMix);
+els.backOriginalBtn.addEventListener("click", backToOriginal);
+els.mixPlayer.addEventListener("play", () => els.player.pause());
+els.player.addEventListener("play", () => els.mixPlayer.pause());
+window.addEventListener("resize", () => { drawWave(); if (state.mix) drawGainChart(); });
 
 renderAll();
